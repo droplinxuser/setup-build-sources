@@ -1,32 +1,49 @@
 #!/usr/bin/env bash
 # Refresh the mirror: the newest release of every source archive the
-# compiled builds of ubuntu-setup-script download (php-fpm, Angie, Valkey),
-# fetched and checked by the same code the servers run
-# (tools/build-common.sh), then added as a release asset.  One release per
-# component (tag = component name); SHA256SUMS in each release lists every
-# archive it holds.  An archive already mirrored is never replaced: if the
-# upstream file under the same name changed, the run fails and says so.
+# compiled builds of ubuntu-setup-script 1.22 download (php-fpm and the php
+# CLI, nginx, Valkey), fetched and checked by the same code the servers run
+# (tools/build-common.sh, plus tools/php-build.sh for SQLite and ICU), then
+# added as a release asset.  One release per component (tag = component
+# name); SHA256SUMS in each release lists every file it holds.  A file
+# already mirrored is never replaced: if the upstream file under the same
+# name changed, the run fails and says so.
+#
+# nginx: each tarball is mirrored with its nginx.org .asc signature next to
+# it.  A server verifies the PGP signature of every nginx tarball, mirrored
+# ones too, and refuses a tarball without one.  This run adds a tarball only
+# after its signature checked out against the pinned nginx.org keys.
 set -Eeuo pipefail
 export LC_ALL=C
 REPO=${GITHUB_REPOSITORY:?run from GitHub Actions or set GITHUB_REPOSITORY=owner/name}
 WORK=${RUNNER_TEMP:-/tmp}/setup-build-mirror
-COMMON_URL=${COMMON_URL:-https://raw.githubusercontent.com/droplinxuser/ubuntu-setup-script/main/tools/build-common.sh}
-rm -rf "$WORK"; mkdir -p "$WORK/cache/src"
-curl -fsSL --retry 3 "$COMMON_URL" -o "$WORK/build-common.sh"
+# The branch of ubuntu-setup-script whose build tools say what to mirror.
+USS_REF=${USS_REF:-main}
+TOOLS_URL=${TOOLS_URL:-https://raw.githubusercontent.com/droplinxuser/ubuntu-setup-script/$USS_REF/tools}
+rm -rf "$WORK"; mkdir -p "$WORK/cache/src" "$WORK/none"
+for t in build-common.sh php-build.sh nginx-build.sh; do
+  curl -fsSL --retry 3 "$TOOLS_URL/$t" -o "$WORK/$t"
+done
+grep -q 'PHP_BUILD_SOURCE_ONLY' "$WORK/php-build.sh" \
+  || { echo "::error::$TOOLS_URL/php-build.sh is older than 1.22 (no PHP_BUILD_SOURCE_ONLY); set USS_REF"; exit 1; }
 
-# What build-common.sh expects from the tool that sources it.  CONF does not
-# exist, so every component resolves to "latest"; the mirror never falls back
-# to itself.
-# shellcheck disable=SC2034
-LOG_TAG=setup-build-mirror SRC_CACHE=$WORK/cache CONF=$WORK/none ROOT=$WORK/none
-export SETUP_BUILD_MIRROR=off
+# What php-build.sh and build-common.sh expect from the environment.  The
+# config file does not exist, so every component resolves to "latest"; the
+# mirror never falls back to itself.  PHP_BUILD_SOURCE_ONLY=1 loads the
+# functions without running a command.
+export SETUP_BUILD_MIRROR=off PHP_BUILD_SOURCE_ONLY=1
+export PHP_BUILD_COMMON=$WORK/build-common.sh PHP_BUILD_CACHE=$WORK/cache
+export PHP_BUILD_ROOT=$WORK/none PHP_BUILD_CONF=$WORK/none/php-build.conf
 # shellcheck source=/dev/null
-. "$WORK/build-common.sh"
+. "$WORK/php-build.sh"
+# shellcheck disable=SC2034 # read by build-common.sh
+LOG_TAG=setup-build-mirror
 
-COMPONENTS=(openssl pcre2 zlib-ng libxml2 libsodium gmp libiconv curl libjpeg-turbo
-            libpng libwebp libzip redis igbinary angie brotli ngx-brotli valkey)
-# PHP: the newest release of every series setup.sh can install.
-PHP_SERIES=(8.3 8.4 8.5 8.6)
+# Every component the three build tools fetch, except LLVM (apt.llvm.org,
+# then LLVM's own GitHub release).  zlib-ng is the default; zlib is the
+# PHP_BUILD_ZLIB=zlib alternative.  ICU is built only for intl.
+COMPONENTS=(openssl pcre2 zlib-ng zlib libxml2 libsodium gmp libiconv curl
+            libjpeg-turbo libpng libwebp libzip sqlite icu redis igbinary
+            nginx brotli ngx-brotli valkey)
 FAIL=0
 ADDED=0 KEPT=0 MISSED=0
 
@@ -59,9 +76,15 @@ publish() { # component file
 mirror_one() { # component version
   local f
   if f=$(fetch_component "$1" "$2"); then
+    # fetch_nginx_signed returns the tarball only when FILE.asc verified.
+    # The signature goes up first, so the tarball is never there without it.
+    if [[ $1 == nginx ]]; then
+      [[ -s $f.asc ]] || { echo "::error::nginx $2: no verified .asc beside the tarball"; FAIL=1; return 0; }
+      publish nginx "$f.asc"
+    fi
     publish "$1" "$f"
   else
-    echo "::warning::$1 $2: no upstream source answered; nothing mirrored this run"
+    echo "::warning::$1 $2: no upstream source answered (or nothing verified); nothing mirrored this run"
     MISSED=$(( MISSED + 1 ))
   fi
 }
@@ -71,11 +94,32 @@ for c in "${COMPONENTS[@]}"; do
   else echo "::warning::$c: cannot resolve the newest release"
   fi
 done
-for x in "${PHP_SERIES[@]}"; do
-  if v=$(latest_of php "$x"); [[ $v == "$x".* ]]; then mirror_one php "$v"
-  else echo "php $x: no release yet"
-  fi
+
+# nginx-build.sh's fallback version: a fresh host whose branding patch fails
+# on the newest mainline builds this one instead.
+fb=$(sed -nE 's/^NGINX_FALLBACK_DEFAULT=([0-9]+\.[0-9]+\.[0-9]+)$/\1/p' "$WORK/nginx-build.sh" | sed -n 1p)
+if [[ -n $fb && $fb != "$(latest_of nginx || true)" ]]; then mirror_one nginx "$fb"; fi
+
+# PHP: the newest release of every series from 8.1 (the oldest the build
+# recipe supports) up to the newest series php.net has released.
+newest=$(php_newest_release || true)
+nx=${newest%.*} nmaj=${newest%%.*}
+[[ $nmaj =~ ^[0-9]+$ ]] || { echo "::warning::cannot resolve the newest PHP release; trying 8.x"; nx="" nmaj=8; }
+for (( maj = 8; maj <= nmaj; maj++ )); do
+  for (( min = (maj == 8 ? 1 : 0); ; min++ )); do
+    x=$maj.$min
+    if [[ -n $nx ]] && ! ver_ge "$nx" "$x"; then break; fi
+    if v=$(latest_of php "$x"); [[ ${v:-} == "$x".* ]]; then mirror_one php "$v"
+    else echo "php $x: no release"; break
+    fi
+  done
 done
+
+# PHP 8.1 builds with the newest OpenSSL 3.x (it does not compile against
+# OpenSSL 4); php-build.sh's latest_of picks that line for series 8.1.
+o3=$(latest_of openssl 8.1 || true)
+if [[ -n $o3 && $o3 != "$(latest_of openssl || true)" ]]; then mirror_one openssl "$o3"; fi
+
 echo "added $ADDED, already mirrored $KEPT, unreachable $MISSED"
 # A run that mirrored nothing at all is broken, not quiet.
 (( ADDED + KEPT > 0 )) || { echo "::error::nothing could be mirrored"; FAIL=1; }
