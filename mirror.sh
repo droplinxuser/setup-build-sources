@@ -11,7 +11,7 @@ export LC_ALL=C
 REPO=${GITHUB_REPOSITORY:?run from GitHub Actions or set GITHUB_REPOSITORY=owner/name}
 WORK=${RUNNER_TEMP:-/tmp}/setup-build-mirror
 COMMON_URL=${COMMON_URL:-https://raw.githubusercontent.com/droplinxuser/ubuntu-setup-script/main/tools/build-common.sh}
-rm -rf "$WORK"; mkdir -p "$WORK"
+rm -rf "$WORK"; mkdir -p "$WORK/cache/src"
 curl -fsSL --retry 3 "$COMMON_URL" -o "$WORK/build-common.sh"
 
 # What build-common.sh expects from the tool that sources it.  CONF does not
@@ -28,6 +28,7 @@ COMPONENTS=(openssl pcre2 zlib-ng libxml2 libsodium gmp libiconv curl libjpeg-tu
 # PHP: the newest release of every series setup.sh can install.
 PHP_SERIES=(8.3 8.4 8.5 8.6)
 FAIL=0
+ADDED=0 KEPT=0 MISSED=0
 
 publish() { # component file
   local comp=$1 f=$2 base sum have
@@ -45,12 +46,14 @@ publish() { # component file
       echo "::error::$comp/$base changed upstream (mirrored $have, now $sum); the mirrored copy is kept"
       FAIL=1
     fi
+    KEPT=$(( KEPT + 1 ))
     return 0
   fi
   gh release upload "$comp" -R "$REPO" "$f" >/dev/null
   printf '%s  %s\n' "$sum" "$base" >> "$WORK/SHA256SUMS"
   gh release upload "$comp" -R "$REPO" "$WORK/SHA256SUMS" --clobber >/dev/null
   echo "added $comp/$base"
+  ADDED=$(( ADDED + 1 ))
 }
 
 mirror_one() { # component version
@@ -59,6 +62,7 @@ mirror_one() { # component version
     publish "$1" "$f"
   else
     echo "::warning::$1 $2: no upstream source answered; nothing mirrored this run"
+    MISSED=$(( MISSED + 1 ))
   fi
 }
 
@@ -72,4 +76,7 @@ for x in "${PHP_SERIES[@]}"; do
   else echo "php $x: no release yet"
   fi
 done
+echo "added $ADDED, already mirrored $KEPT, unreachable $MISSED"
+# A run that mirrored nothing at all is broken, not quiet.
+(( ADDED + KEPT > 0 )) || { echo "::error::nothing could be mirrored"; FAIL=1; }
 exit "$FAIL"
